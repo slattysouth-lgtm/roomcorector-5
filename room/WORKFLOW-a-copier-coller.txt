@@ -1,0 +1,167 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+
+    steps:
+      - name: Recuperer le projet
+        uses: actions/checkout@v4
+
+      # ---------- VERSION COMPLETE ----------
+      - name: Configurer FULL
+        id: cfgfull
+        shell: pwsh
+        run: |
+          cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object -FilePath cfg-full.txt
+          exit $LASTEXITCODE
+
+      - name: Compiler FULL
+        id: buildfull
+        shell: pwsh
+        run: |
+          cmake --build build --config Release 2>&1 | Tee-Object -FilePath cmp-full.txt
+          exit $LASTEXITCODE
+
+      # ---------- VERSION D'ESSAI ----------
+      - name: Configurer TRIAL
+        id: cfgtrial
+        if: success()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cmake -B build-trial -A x64 -DCMAKE_BUILD_TYPE=Release -DRC_TRIAL=ON 2>&1 | Tee-Object -FilePath cfg-trial.txt
+          exit $LASTEXITCODE
+
+      - name: Compiler TRIAL
+        id: buildtrial
+        if: steps.cfgtrial.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cmake --build build-trial --config Release 2>&1 | Tee-Object -FilePath cmp-trial.txt
+          exit $LASTEXITCODE
+
+      # ---------- ERREURS AFFICHEES SUR LA PAGE SUMMARY ----------
+      - name: Afficher les erreurs dans le resume
+        if: always()
+        shell: pwsh
+        run: |
+          $sum = $env:GITHUB_STEP_SUMMARY
+          Add-Content $sum "# Rapport de compilation"
+          $any = $false
+          foreach ($f in @("cfg-full.txt","cmp-full.txt","cfg-trial.txt","cmp-trial.txt")) {
+            if (Test-Path $f) {
+              $errs = Select-String -Path $f -Pattern "error|Error|ERREUR|A ECHOUE" |
+                      Select-Object -ExpandProperty Line -Unique | Select-Object -First 25
+              if ($errs) {
+                $any = $true
+                Add-Content $sum ""
+                Add-Content $sum ("## ERREURS dans " + $f)
+                Add-Content $sum '```'
+                foreach ($l in $errs) { Add-Content $sum $l }
+                Add-Content $sum '```'
+              }
+            }
+          }
+          if (-not $any) { Add-Content $sum "" ; Add-Content $sum "Aucune erreur detectee." }
+          Add-Content $sum ""
+          Add-Content $sum "## Fichiers produits"
+          Add-Content $sum '```'
+          foreach ($d in @("build","build-trial")) {
+            if (Test-Path $d) {
+              $items = Get-ChildItem $d -Recurse -Include *.vst3,*.exe -ErrorAction SilentlyContinue |
+                       Select-Object -ExpandProperty FullName -First 20
+              if ($items) { foreach ($i in $items) { Add-Content $sum $i } }
+              else { Add-Content $sum ("$d : rien de produit") }
+            } else { Add-Content $sum ("$d : dossier absent") }
+          }
+          Add-Content $sum '```'
+
+      # ---------- INSTALLATEURS ----------
+      - name: Construire les installateurs
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $f = Get-ChildItem "C:\Program Files*" -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) { $iscc = $f.FullName } else { Write-Host "ISCC introuvable"; exit 0 }
+          }
+          function Make-Installer([string]$dir,[string]$appName,[string]$outName) {
+            if (-not (Test-Path $dir)) { Write-Host "$dir absent, ignore"; return }
+            $vst3 = Get-ChildItem $dir -Recurse -Directory -Filter *.vst3 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $vst3) { Write-Host "pas de vst3 dans $dir, ignore"; return }
+            $sa = Get-ChildItem $dir -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Standalone' } | Select-Object -First 1
+            $iss = New-Object System.Collections.ArrayList
+            [void]$iss.Add('[Setup]')
+            [void]$iss.Add("AppName=$appName")
+            [void]$iss.Add('AppVersion=1.0.0')
+            [void]$iss.Add('AppPublisher=Uncertain')
+            [void]$iss.Add("DefaultDirName={commonpf}\Uncertain\$appName")
+            [void]$iss.Add('DisableProgramGroupPage=yes')
+            [void]$iss.Add("OutputBaseFilename=$outName")
+            [void]$iss.Add('ArchitecturesInstallIn64BitMode=x64')
+            [void]$iss.Add('Compression=lzma2')
+            [void]$iss.Add('PrivilegesRequired=admin')
+            [void]$iss.Add('WizardStyle=modern')
+            [void]$iss.Add('')
+            [void]$iss.Add('[Files]')
+            [void]$iss.Add('Source: "' + $vst3.FullName + '\*"; DestDir: "{commoncf64}\VST3\' + $vst3.Name + '"; Flags: recursesubdirs createallsubdirs ignoreversion')
+            if ($sa) {
+              [void]$iss.Add('Source: "' + $sa.FullName + '"; DestDir: "{app}"; Flags: ignoreversion')
+              [void]$iss.Add('')
+              [void]$iss.Add('[Icons]')
+              [void]$iss.Add('Name: "{autoprograms}\' + $appName + '"; Filename: "{app}\' + $sa.Name + '"')
+            }
+            Set-Content -Path "$outName.iss" -Value $iss -Encoding UTF8
+            & "$iscc" "$outName.iss" 2>&1 | Tee-Object -Append -FilePath installer-log.txt
+          }
+          Make-Installer 'build'       'Room Corrector'       'RoomCorrector-Setup'
+          Make-Installer 'build-trial' 'Room Corrector Trial' 'RoomCorrector-TRIAL-Setup'
+          if (Test-Path Output) { Get-ChildItem Output }
+
+      # ---------- ARTIFACTS ----------
+      - name: Publier les logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BUILD-LOGS
+          path: |
+            cfg-full.txt
+            cmp-full.txt
+            cfg-trial.txt
+            cmp-trial.txt
+            installer-log.txt
+          if-no-files-found: warn
+
+      - name: Publier FULL
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoomCorrector-FULL
+          path: build/RoomCorrector_artefacts/Release/
+          if-no-files-found: warn
+
+      - name: Publier TRIAL
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoomCorrector-TRIAL
+          path: build-trial/RoomCorrector_artefacts/Release/
+          if-no-files-found: warn
+
+      - name: Publier les installateurs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoomCorrector-Installers
+          path: Output/*.exe
+          if-no-files-found: warn
