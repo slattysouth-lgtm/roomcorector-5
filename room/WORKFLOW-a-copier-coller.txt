@@ -1,0 +1,117 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+
+    steps:
+      - name: Recuperer le projet
+        uses: actions/checkout@v4
+
+      - name: Configurer FULL + TRIAL (CMake)
+        shell: pwsh
+        run: |
+          cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object -FilePath configure-log.txt
+          if ($LASTEXITCODE -ne 0) { Write-Host "=== CONFIGURE FULL A ECHOUE ===" ; exit 1 }
+          cmake -B build-trial -A x64 -DCMAKE_BUILD_TYPE=Release -DRC_TRIAL=ON 2>&1 | Tee-Object -Append -FilePath configure-log.txt
+          if ($LASTEXITCODE -ne 0) { Write-Host "=== CONFIGURE TRIAL A ECHOUE ===" ; exit 1 }
+
+      - name: Compiler FULL (version complete)
+        shell: pwsh
+        run: |
+          cmake --build build --config Release 2>&1 | Tee-Object -FilePath compile-log.txt
+          if ($LASTEXITCODE -ne 0) { Write-Host "=== COMPILATION FULL A ECHOUE ===" ; exit 1 }
+
+      - name: Compiler TRIAL (version d'essai)
+        shell: pwsh
+        run: |
+          cmake --build build-trial --config Release 2>&1 | Tee-Object -Append -FilePath compile-log.txt
+          if ($LASTEXITCODE -ne 0) { Write-Host "=== COMPILATION TRIAL A ECHOUE ===" ; exit 1 }
+
+      - name: Construire les 2 installateurs (Inno Setup)
+        if: success()
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $found = Get-ChildItem "C:\Program Files*" -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $iscc = $found.FullName } else { Write-Host "=== ISCC.exe INTROUVABLE ==="; exit 1 }
+          }
+
+          function Make-Installer([string]$dir,[string]$appName,[string]$outName) {
+            $vst3 = Get-ChildItem $dir -Recurse -Directory -Filter *.vst3 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $vst3) { Write-Host "=== AUCUN .vst3 DANS $dir ==="; Get-ChildItem $dir -Recurse -Directory | Select-Object FullName; exit 1 }
+            $sa = Get-ChildItem $dir -Recurse -File -Filter *.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Standalone' } | Select-Object -First 1
+            $iss = New-Object System.Collections.ArrayList
+            [void]$iss.Add('[Setup]')
+            [void]$iss.Add("AppName=$appName")
+            [void]$iss.Add('AppVersion=1.0.0')
+            [void]$iss.Add('AppPublisher=Uncertain')
+            [void]$iss.Add("DefaultDirName={commonpf}\Uncertain\$appName")
+            [void]$iss.Add('DisableProgramGroupPage=yes')
+            [void]$iss.Add("OutputBaseFilename=$outName")
+            [void]$iss.Add('ArchitecturesInstallIn64BitMode=x64')
+            [void]$iss.Add('Compression=lzma2')
+            [void]$iss.Add('SolidCompression=yes')
+            [void]$iss.Add('PrivilegesRequired=admin')
+            [void]$iss.Add('WizardStyle=modern')
+            [void]$iss.Add("UninstallDisplayName=$appName by Uncertain")
+            [void]$iss.Add('')
+            [void]$iss.Add('[Files]')
+            [void]$iss.Add('Source: "' + $vst3.FullName + '\*"; DestDir: "{commoncf64}\VST3\' + $vst3.Name + '"; Flags: recursesubdirs createallsubdirs ignoreversion')
+            if ($sa) {
+              [void]$iss.Add('Source: "' + $sa.FullName + '"; DestDir: "{app}"; Flags: ignoreversion')
+              [void]$iss.Add('')
+              [void]$iss.Add('[Icons]')
+              [void]$iss.Add('Name: "{autoprograms}\' + $appName + '"; Filename: "{app}\' + $sa.Name + '"')
+            }
+            $issFile = "$outName.iss"
+            Set-Content -Path $issFile -Value $iss -Encoding UTF8
+            & "$iscc" $issFile 2>&1 | Tee-Object -Append -FilePath installer-log.txt
+            if ($LASTEXITCODE -ne 0) { Write-Host "=== INSTALLATEUR $appName A ECHOUE ==="; exit 1 }
+          }
+
+          Make-Installer 'build'       'Room Corrector'       'RoomCorrector-Setup'
+          Make-Installer 'build-trial' 'Room Corrector Trial' 'RoomCorrector-TRIAL-Setup'
+          Get-ChildItem Output
+
+      - name: Publier les logs (TOUJOURS, meme si echec)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BUILD-LOGS
+          path: |
+            configure-log.txt
+            compile-log.txt
+            installer-log.txt
+          if-no-files-found: warn
+
+      - name: Publier FULL (vst3 + standalone)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoomCorrector-FULL
+          path: build/RoomCorrector_artefacts/Release/
+          if-no-files-found: warn
+
+      - name: Publier TRIAL (vst3 + standalone)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoomCorrector-TRIAL
+          path: build-trial/RoomCorrector_artefacts/Release/
+          if-no-files-found: warn
+
+      - name: Publier les 2 installateurs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RoomCorrector-Installers
+          path: Output/*.exe
+          if-no-files-found: warn
